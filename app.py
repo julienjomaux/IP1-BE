@@ -3,6 +3,24 @@ import pandas as pd
 from datetime import datetime, time
 import matplotlib.pyplot as plt
 
+from st_paywall import add_auth
+
+st.title("My Subscription App")
+
+# Handle Streamlit's native authentication
+if not st.user.is_logged_in:
+    if st.button("Log in using Streamlit's native authentication"):
+        st.login()
+else:
+    # Add subscription check for logged-in users
+    add_auth()
+    
+    # Your app code here - only runs for subscribed users
+    st.write("Welcome, subscriber!")
+    st.write(f"Your email is: {st.user.email}")
+
+
+
 st.set_page_config(page_title="SI Analysis Dashboard", layout="wide")
 
 st.title("System Imbalance Analysis")
@@ -165,9 +183,3 @@ except Exception as e:
 
     st.error(f"An error occurred: {e}")
 
-if 'logged_in' in st.session_state.keys():
-    if st.session_state['logged_in']:
-        st.markdown('## Ask Me Anything')
-        question = st.text_input('Ask your question')
-        if question != '':
-            st.write('I drink and I know things.')
