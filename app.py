@@ -5,8 +5,6 @@ import matplotlib.pyplot as plt
 
 from st_paywall import add_auth
 
-st.title("My Subscription App")
-
 
 st.set_page_config(page_title="SI Analysis Dashboard", layout="wide")
 
@@ -169,5 +167,6 @@ except FileNotFoundError as e:
 except Exception as e:
 
     st.error(f"An error occurred: {e}")
+
 
 
