@@ -7,19 +7,6 @@ from st_paywall import add_auth
 
 st.title("My Subscription App")
 
-# Handle Streamlit's native authentication
-if not st.user.is_logged_in:
-    if st.button("Log in using Streamlit's native authentication"):
-        st.login()
-else:
-    # Add subscription check for logged-in users
-    add_auth()
-    
-    # Your app code here - only runs for subscribed users
-    st.write("Welcome, subscriber!")
-    st.write(f"Your email is: {st.user.email}")
-
-
 
 st.set_page_config(page_title="SI Analysis Dashboard", layout="wide")
 
@@ -182,4 +169,5 @@ except FileNotFoundError as e:
 except Exception as e:
 
     st.error(f"An error occurred: {e}")
+
 
