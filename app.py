@@ -162,4 +162,12 @@ try:
 except FileNotFoundError as e:
     st.error(f"Missing file: {e}")
 except Exception as e:
+
     st.error(f"An error occurred: {e}")
+
+if 'logged_in' in st.session_state.keys():
+    if st.session_state['logged_in']:
+        st.markdown('## Ask Me Anything')
+        question = st.text_input('Ask your question')
+        if question != '':
+            st.write('I drink and I know things.')
