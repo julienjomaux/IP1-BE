@@ -1,172 +1,314 @@
-import streamlit as st
+
+import os
+import glob
+import time
+from typing import Optional, List, Tuple, Dict
+
 import pandas as pd
-from datetime import datetime, time
+import streamlit as st
+import seaborn as sns
 import matplotlib.pyplot as plt
+from calendar import month_abbr
 
-from st_paywall import add_auth
+# ---------------- Page setup ----------------
+st.set_page_config(page_title="FCR Heatmap — Price, Demand, Import/Export", layout="wide")
 
+# Years you want to expose in the UI (adapt if you add more files)
+YEARS = [2021, 2022, 2023, 2024, 2025]
 
-st.set_page_config(page_title="SI Analysis Dashboard", layout="wide")
+# Where to look for the Excel files.
+# The app will first try the current folder, then a ./data subfolder.
+FILENAME_PATTERN = "RESULT_OVERVIEW_CAPACITY_MARKET_FCR_{y}.xlsx"
+SEARCH_LOCATIONS = ["", "data"]  # "" = current folder
 
-st.title("System Imbalance Analysis")
+# Country harmonization (extend as needed)
+COUNTRY_RENAME = {
+    'BE': 'BELGIUM', 'BELGIUM': 'BELGIUM',
+    'DE': 'GERMANY', 'GERMANY': 'GERMANY',
+    'FR': 'FRANCE', 'FRANCE': 'FRANCE',
+    'NL': 'NETHERLANDS', 'NETHERLANDS': 'NETHERLANDS',
+    'AT': 'AUSTRIA', 'AUSTRIA': 'AUSTRIA',
+    'SI': 'SLOVENIA', 'SLOVENIA': 'SLOVENIA',
+    'DK': 'DENMARK', 'DENMARK': 'DENMARK',
+    'CH': 'SWITZERLAND', 'SWITZERLAND': 'SWITZERLAND',
+}
 
-st.markdown(
+def harmonize_country(name: str) -> str:
+    name = str(name).upper().strip()
+    return COUNTRY_RENAME.get(name, name)
+
+def product_bin_label(product: str) -> str:
+    """Turns '0' -> '0 to 4', '5' -> '5 to 9', else returns as-is."""
+    try:
+        val = int(str(product).strip())
+        return f"{val} to {val+4}"
+    except Exception:
+        return str(product)
+
+def find_local_file_for_year(year: int) -> Optional[str]:
     """
-    This dashboard allows you to analyze the Belgian System Imbalance (SI) per minute, the rate of change of SI
-    and the Imbalance Prices per minute over a selected time window.
-
-    Simply change the dates and hours to get the time window requested.
-    Data coverage: **1 January 2025 to 14 January 2026**.
+    Look for RESULT_OVERVIEW_CAPACITY_MARKET_FCR_{year}.xlsx
+    first in the app folder, then in ./data.
+    Returns absolute path or None.
     """
+    candidates = []
+    for loc in SEARCH_LOCATIONS:
+        pattern = os.path.join(loc, FILENAME_PATTERN.format(y=year))
+        candidates.extend(glob.glob(pattern))
+    if not candidates:
+        return None
+    # If multiple matches, take the newest
+    candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+    return os.path.abspath(candidates[0])
+
+@st.cache_data(show_spinner=False)
+def load_year_df(path: str, mtime: float) -> Optional[pd.DataFrame]:
+    """
+    Load the given Excel file and return a cleaned DataFrame.
+    Cache is keyed by (path, mtime) via arguments.
+    """
+    try:
+        df = pd.read_excel(path, engine="openpyxl")
+    except Exception:
+        return None
+
+    if df is None or df.empty or 'DATE_FROM' not in df.columns:
+        return None
+
+    df = df.copy()
+    df['DATE'] = pd.to_datetime(df['DATE_FROM'], dayfirst=True, errors='coerce')
+    df['YEAR'] = df['DATE'].dt.year
+    df['MONTH'] = df['DATE'].dt.month
+    df['MONTH_NAME'] = df['DATE'].dt.strftime('%b')
+    return df
+
+# ---------------- Metric specifications ----------------
+METRICS: Dict[str, Dict[str, Optional[str]]] = {
+    "PRICE": {
+        "label": "Settlement Capacity Price",
+        "suffix": "SETTLEMENTCAPACITY_PRICE_[EUR/MW]",
+        "cbar_label": "€/MW",
+        "cmap": "YlOrRd",
+        "center": None,
+        "title_suffix": "Average Capacity Price FCR",
+    },
+    "DEMAND": {
+        "label": "Demand",
+        "suffix": "DEMAND_[MW]",
+        "cbar_label": "MW",
+        "cmap": "YlGnBu",
+        "center": None,
+        "title_suffix": "Average Demand FCR",
+    },
+    "IMPORT_EXPORT": {
+        "label": "Import (−) / Export (+)",
+        "suffix": "IMPORT(-)_EXPORT(+)_[MW]",
+        "cbar_label": "MW",
+        "cmap": "coolwarm",
+        "center": 0.0,  # Diverging map centered at 0 to show import(-) vs export(+)
+        "title_suffix": "Average Import(−)/Export(+) FCR",
+    },
+}
+
+def extract_countries_from_df(df: pd.DataFrame) -> List[str]:
+    """
+    Detect available countries based on any of the metric suffixes.
+    We consider columns like 'AT_DEMAND_[MW]' or 'BE_*SETTLEMENTCAPACITY_PRICE_[EUR/MW]'.
+    """
+    suffixes = [spec["suffix"] for spec in METRICS.values()]
+    candidates = set()
+    for col in df.columns:
+        col_str = str(col)
+        for suf in suffixes:
+            if col_str.endswith(suf):
+                prefix = col_str.split('_')[0]
+                candidates.add(harmonize_country(prefix))
+                break
+    return sorted(candidates)
+
+def find_metric_column_for_country(df: pd.DataFrame, country: str, metric_key: str) -> Optional[str]:
+    """
+    From df, find the column name matching the selected country and metric.
+    Country is tested via the prefix before the first underscore.
+    """
+    suffix = METRICS[metric_key]["suffix"]
+    matches = []
+    for col in df.columns:
+        col_str = str(col)
+        if col_str.endswith(suffix):
+            prefix = col_str.split('_')[0]
+            if harmonize_country(prefix) == country:
+                matches.append(col_str)
+    return matches[0] if matches else None
+
+def ensure_product_column(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure PRODUCTNAME exists. If it's missing, create a single bucket 'ALL'.
+    """
+    df = df.copy()
+    if 'PRODUCTNAME' not in df.columns:
+        df['PRODUCTNAME'] = 'ALL'
+    return df
+
+def build_heatmap_for(df: pd.DataFrame, year: int, country: str, metric_key: str):
+    """
+    Returns (heatmap_data, x_labels_bins, months_label, cbar_label, cmap, center, title_suffix)
+    - heatmap_data: index: months (Jan..Dec), columns: PRODUCTNAME (sorted)
+    - x_labels_bins: pretty x labels (e.g., '0 to 4' for 0/5/... if product names are numeric)
+    - months_label: ['Jan', ..., 'Dec']
+    """
+    year_df = df[df['YEAR'] == year].copy()
+    if year_df.empty:
+        return None, None, None, None, None, None, None
+
+    metric_col = find_metric_column_for_country(year_df, country, metric_key)
+    if not metric_col:
+        return None, None, None, None, None, None, None
+
+    year_df = ensure_product_column(year_df)
+    year_df[metric_col] = pd.to_numeric(year_df[metric_col], errors='coerce')
+    year_df['PRODUCTNAME'] = year_df['PRODUCTNAME'].astype(str)
+
+    # Sort product bins: numeric first by value, then non-numeric
+    products = sorted(
+        year_df['PRODUCTNAME'].dropna().unique().tolist(),
+        key=lambda x: (0, int(x)) if str(x).isdigit() else (1, str(x))
+    )
+    if not products:
+        return None, None, None, None, None, None, None
+
+    grouped = (
+        year_df
+        .dropna(subset=[metric_col])
+        .groupby(['MONTH_NAME', 'PRODUCTNAME'])[metric_col]
+        .mean()
+        .reset_index()
+    )
+
+    months_label = [month_abbr[m] for m in range(1, 13)]
+
+    # Build full grid of months x products to keep order
+    all_months = pd.DataFrame({'MONTH_NAME': months_label})
+    all_prods = pd.DataFrame({'PRODUCTNAME': products})
+    all_months['k'] = 1
+    all_prods['k'] = 1
+    full_index = pd.merge(all_months, all_prods, on='k').drop(columns='k')
+
+    merged = pd.merge(full_index, grouped, on=['MONTH_NAME', 'PRODUCTNAME'], how='left')
+    heatmap = merged.pivot(index='MONTH_NAME', columns='PRODUCTNAME', values=metric_col)
+    heatmap = heatmap.reindex(index=months_label, columns=products)
+
+    x_labels_bins = [product_bin_label(p) for p in products]
+
+    spec = METRICS[metric_key]
+    cbar_label = spec["cbar_label"]
+    cmap = spec["cmap"]
+    center = spec["center"]
+    title_suffix = spec["title_suffix"]
+
+    return heatmap, x_labels_bins, months_label, cbar_label, cmap, center, title_suffix
+
+# ---------------- UI ----------------
+st.title("FCR Heatmap — Price, Demand, Import/Export")
+st.caption("Reads local Excel files named: RESULT_OVERVIEW_CAPACITY_MARKET_FCR_YYYY.xlsx")
+
+# Sidebar controls
+with st.sidebar:
+    # Year
+    year_default_index = len(YEARS) - 1 if YEARS else 0
+    year = st.selectbox("Year", YEARS, index=year_default_index)
+
+    # Load file for year
+    path = find_local_file_for_year(year)
+    if not path or not os.path.exists(path):
+        st.error(
+            f"File not found for {year}. Expected name: "
+            f"`{FILENAME_PATTERN.format(y=year)}` in the app folder or `./data/`."
+        )
+        st.stop()
+
+    mtime = os.path.getmtime(path)
+    with st.spinner(f"Loading {os.path.basename(path)} …"):
+        df_year = load_year_df(path, mtime)
+
+    if df_year is None:
+        st.error("Could not load or parse the Excel file (missing 'DATE_FROM' or empty).")
+        st.stop()
+
+    # Countries (from any metric)
+    countries = extract_countries_from_df(df_year)
+    if not countries:
+        st.error("No countries detected in the file. Check the column names.")
+        st.stop()
+
+    # Try to default to BELGIUM if present; else first in the list
+    if "BELGIUM" in countries:
+        default_country_idx = countries.index("BELGIUM")
+    else:
+        default_country_idx = 0
+
+    country = st.selectbox("Country", countries, index=default_country_idx)
+
+    # Metric selection
+    metric_options = {
+        "PRICE": "Settlement Capacity Price (€/MW)",
+        "DEMAND": "Demand (MW)",
+        "IMPORT_EXPORT": "Import (−) / Export (+) (MW)"
+    }
+    metric_key = st.selectbox(
+        "Metric",
+        list(metric_options.keys()),
+        format_func=lambda k: metric_options[k],
+        index=0
+    )
+
+# Main visualization
+heatmap_data, x_labels_bins, months_label, cbar_label, cmap, center, title_suffix = build_heatmap_for(
+    df_year, year, country, metric_key
 )
 
-# --- SIDEBAR CONTROLS ---
-st.sidebar.header("Select Time Window")
+if heatmap_data is None or heatmap_data.empty:
+    st.warning("No data found for this selection (metric & country).")
+else:
+    fig, ax = plt.subplots(figsize=(11, 6))
+    sns.set(style="white")
 
-# Date Inputs
-col1, col2 = st.sidebar.columns(2)
-with col1:
-    start_date = st.date_input("Start Date", datetime(2025, 7, 14))
-    end_date = st.date_input("End Date", datetime(2025, 7, 14))
+    # Choose diverging for import/export with center=0
+    sns.heatmap(
+        heatmap_data,
+        annot=False,
+        cmap=cmap,
+        center=center,
+        cbar_kws={'label': cbar_label},
+        ax=ax
+    )
 
-# Hour Inputs
-with col2:
-    start_hour = st.number_input("Start Hour", min_value=0, max_value=23, value=16)
-    end_hour = st.number_input("End Hour", min_value=0, max_value=23, value=20)
+    spec = METRICS[metric_key]
+    ax.set_title(f"{spec['title_suffix']} — {country} — {year}")
+    ax.set_xticks([i + 0.5 for i in range(len(heatmap_data.columns))])
+    ax.set_xticklabels(x_labels_bins, rotation=45, ha='right')
+    ax.set_yticks([i + 0.5 for i in range(len(heatmap_data.index))])
+    ax.set_yticklabels(months_label, rotation=0)
+    ax.set_xlabel('')
+    ax.set_ylabel('')
+    plt.tight_layout()
+    st.pyplot(fig)
 
-# Combine Date and Hour for filtering
-start_dt = datetime.combine(start_date, time(start_hour, 0))
-end_dt = datetime.combine(end_date, time(end_hour, 59))
+# Notes
+st.markdown(
+    """
+**Notes**
 
-# --- FIXED CSV FILES ---
-CSV_FILES = [
-    "IP1-1.csv",  # 1 Jan 2025 → 30 May 2025
-    "IP1-2.csv",  # 1 Jun 2025 → 30 Sep 2025
-    "IP1-3.csv",  # 1 Oct 2025 → 14 Jan 2026
-]
-
-try:
-    @st.cache_data
-    def load_data(file_paths):
-        all_data = []
-
-        for file_path in file_paths:
-            df_raw = pd.read_csv(file_path, header=None, encoding='utf-8-sig')
-
-            # Split header
-            header = df_raw.iloc[0, 0].split(';')
-
-            # Split data rows
-            data = df_raw.iloc[1:, 0].str.split(';', expand=True)
-            data.columns = header
-            data = data.reset_index(drop=True)
-
-            # Clean numeric columns
-            data['System imbalance'] = pd.to_numeric(
-                data['System imbalance'].str.replace(',', '.', regex=False),
-                errors='coerce'
-            )
-
-            data['Imbalance Price'] = pd.to_numeric(
-                data['Imbalance Price'].str.replace(',', '.', regex=False),
-                errors='coerce'
-            )
-
-            # Parse datetime (remove timezone)
-            data['Datetime'] = pd.to_datetime(
-                data['Datetime'].str.split('+').str[0],
-                errors='coerce'
-            )
-
-            # Drop invalid rows
-            data = data.dropna(subset=['Datetime', 'System imbalance', 'Imbalance Price'])
-
-            all_data.append(data)
-
-        return pd.concat(all_data, ignore_index=True)
-
-    # Load and merge all CSVs
-    data = load_data(CSV_FILES)
-
-    # Filter data based on sidebar inputs
-    mask = (data['Datetime'] >= start_dt) & (data['Datetime'] <= end_dt)
-    df_filtered = data.loc[mask].sort_values('Datetime').reset_index(drop=True)
-
-    if df_filtered.empty:
-        st.warning("No data found for the selected time range.")
-    else:
-        # --- CALCULATIONS ---
-        timestamps = df_filtered['Datetime'].tolist()
-        cumulative_si = df_filtered['System imbalance'].tolist()
-        imbalance_price = df_filtered['Imbalance Price'].tolist()
-
-        instantaneous_si = []
-        for i, cumul in enumerate(cumulative_si):
-            minute = timestamps[i].minute
-            block_start = (minute // 15) * 15
-            block_index = minute - block_start + 1
-            if block_index == 1:
-                inst = cumul
-            else:
-                prev_cumul = cumulative_si[i - 1]
-                inst = block_index * cumul - (block_index - 1) * prev_cumul
-            instantaneous_si.append(inst)
-
-        delta_si = [
-            instantaneous_si[i] - instantaneous_si[i - 1]
-            for i in range(1, len(instantaneous_si))
-        ]
-
-        # --- PLOTTING ---
-        fig, axs = plt.subplots(3, 1, figsize=(15, 12), sharex=True)
-
-        axs[0].step(timestamps, cumulative_si, where='post', label='Cumulative SI')
-        axs[0].step(timestamps, instantaneous_si, where='post', label='Instantaneous SI', alpha=0.7)
-        axs[0].set_title('Cumulative SI and Instantaneous SI')
-        axs[0].set_ylabel('System Imbalance')
-        axs[0].legend()
-        axs[0].grid(True)
-
-        axs[1].step(
-            timestamps[1:], delta_si, where='post',
-            label='Minute-by-Minute Change', color='purple'
-        )
-        axs[1].set_title('Minute-by-Minute Change of Instantaneous SI')
-        axs[1].set_ylabel('Delta SI')
-        axs[1].legend()
-        axs[1].grid(True)
-
-        axs[2].step(
-            timestamps, imbalance_price, where='post',
-            label='Imbalance Price', color='orange'
-        )
-        axs[2].set_title('Imbalance Price')
-        axs[2].set_xlabel('Time')
-        axs[2].set_ylabel('Price')
-        axs[2].legend()
-        axs[2].grid(True)
-
-        # Vertical lines logic (24h check)
-        span_seconds = (timestamps[-1] - timestamps[0]).total_seconds()
-        if span_seconds <= 24 * 3600:
-            quarter_hour_lines = [
-                ts for ts in timestamps if ts.minute in [0, 15, 30, 45]
-            ]
-            for ax in axs:
-                for qhl in quarter_hour_lines:
-                    ax.axvline(qhl, color='gray', linestyle='--', alpha=0.3)
-
-        plt.tight_layout()
-        st.pyplot(fig)
-
-        if st.checkbox("Show Raw Data Table"):
-            st.write(df_filtered)
-
-except FileNotFoundError as e:
-    st.error(f"Missing file: {e}")
-except Exception as e:
-
-    st.error(f"An error occurred: {e}")
-
-
-
+- Place files next to `app.py` or under `./data/`.
+- File name must be exactly `RESULT_OVERVIEW_CAPACITY_MARKET_FCR_YYYY.xlsx`.
+- Country-specific columns follow these patterns (prefix is the country code, e.g., `AT`, `BE`, …):
+  - **Price**: `CC_SETTLEMENTCAPACITY_PRICE_[EUR/MW]`
+  - **Demand**: `CC_DEMAND_[MW]`
+  - **Import(−)/Export(+)**: `CC_IMPORT(-)_EXPORT(+)_[MW]`
+- The heatmap shows monthly **average values** per `PRODUCTNAME`.  
+  If `PRODUCTNAME` is missing in your file, the app will aggregate into a single bucket **ALL**.
+- Import(−)/Export(+) uses a diverging colormap centered at 0:
+  - **Blue** = Import (negative)
+  - **Red** = Export (positive)
+"""
+)
